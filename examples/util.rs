@@ -1,11 +1,20 @@
+#![allow(dead_code)]
+#![allow(unused_variables)]
 //! Utility traits, functions used in the crate.
-use eth_types::evm_types::{GasCost, OpcodeId};
-use halo2_proofs::{arithmetic::FieldExt, plonk::Expression};
+//!
+
+use halo2_proofs::{ arithmetic::{Field as Halo2Field, FieldExt}, plonk::Expression};
+use halo2_proofs::circuit::AssignedCell;
+use pairing::{
+    bn256::{Fq, Fr},
+    group::ff::PrimeField,
+};
+
 
 /// Returns the sum of the passed in cells
 pub mod sum {
-    use crate::util::Expr;
     use halo2_proofs::{arithmetic::FieldExt, plonk::Expression};
+    use crate::util::Expr;
 
     /// Returns an expression for the sum of the list of expressions.
     pub fn expr<F: FieldExt, E: Expr<F>, I: IntoIterator<Item = E>>(inputs: I) -> Expression<F> {
@@ -147,8 +156,29 @@ impl_expr!(bool);
 impl_expr!(u8);
 impl_expr!(u64);
 impl_expr!(usize);
-impl_expr!(OpcodeId, OpcodeId::as_u8);
-impl_expr!(GasCost, GasCost::as_u64);
+
+pub trait Field: FieldExt + Halo2Field + PrimeField<Repr = [u8; 32]> {}
+
+// Impl custom `Field` trait for BN256 Fr to be used and consistent with the
+// rest of the workspace.
+impl Field for Fr {}
+
+// Impl custom `Field` trait for BN256 Frq to be used and consistent with the
+// rest of the workspace.
+impl Field for Fq {}
+
+
+/// Restrict an expression to be a boolean.
+pub fn bool_check<F: Field>(value: Expression<F>) -> Expression<F> {
+    range_check(value, 2)
+}
+
+/// Restrict an expression such that 0 <= word < range.
+pub fn range_check<F: Field>(word: Expression<F>, range: usize) -> Expression<F> {
+    (1..range).fold(word.clone(), |acc, i| {
+        acc * (Expression::Constant(F::from(i as u64)) - word.clone())
+    })
+}
 
 impl<F: FieldExt> Expr<F> for Expression<F> {
     #[inline]
@@ -193,4 +223,21 @@ pub fn expr_from_bytes<F: FieldExt, E: Expr<F>>(bytes: &[E]) -> Expression<F> {
 /// Returns 2**by as FieldExt
 pub fn pow_of_two<F: FieldExt>(by: usize) -> F {
     F::from(2).pow(&[by as u64, 0, 0, 0])
+}
+
+#[allow(dead_code)]
+/// An assigned cell in the circuit.
+#[derive(Clone, Debug)]
+pub struct Variable<T, F: Field> {
+    assig_cell: AssignedCell<F, F>,
+    value: Option<T>,
+}
+
+impl<T, F: Field> Variable<T, F> {
+    pub(crate) fn new(assig_cell: AssignedCell<F, F>, value: Option<T>) -> Self {
+        Self { assig_cell, value }
+    }
+}
+fn main() {
+    println!("hello world")
 }

@@ -1,103 +1,147 @@
 use halo2_proofs::circuit::SimpleFloorPlanner;
 use halo2_proofs::{
-    arithmetic::FieldExt,
-    circuit::{Chip, Layouter},
+    arithmetic::{  FieldExt},
+    circuit::{Chip, Layouter, Region},
     dev::{
-         MockProver,
-        VerifyFailure::{self},
-    },
+        MockProver,
+     },
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Selector, VirtualCells,
+        Advice, Circuit, Column, ConstraintSystem, Error, Expression,   Selector, VirtualCells,
     },
     poly::Rotation,
 };
-use pairing::bn256::Fr as Fp;
+
+
 use std::marker::PhantomData;
+use pairing::{
+    bn256::{Fr},
+ };
 
-#[allow(dead_code)]
+
+// a > b
+
+// a - b
+// b < a, b -a
+pub mod util;
+
+use util::{
+    expr_from_bytes, pow_of_two, Field, bool_check,
+};
+
+
+/// Instruction that the Lt chip needs to implement.
+pub trait LtInstruction<F: FieldExt> {
+    /// Assign the lhs and rhs witnesses to the Lt chip's region.
+    fn assign(
+        &self,
+        region: &mut Region<'_, F>,
+        offset: usize,
+        lhs: F,
+        rhs: F,
+    ) -> Result<(), Error>;
+}
+
+/// Config for the Lt chip.
+#[derive(Clone, Copy, Debug)]
+pub struct LtConfig<F, const N_BYTES: usize> {
+    /// Denotes the lt outcome. If lhs < rhs then lt == 1, otherwise lt == 0.
+    pub lt: Column<Advice>,
+    /// Denotes the bytes representation of the difference between lhs and rhs.
+    /// Note that the range of each byte is not checked by this config.
+    pub diff: [Column<Advice>; N_BYTES],
+    /// Denotes the range within which both lhs and rhs lie.
+    pub range: F,
+}
+
+impl<F: Field, const N_BYTES: usize> LtConfig<F, N_BYTES> {
+    /// Returns an expression that denotes whether lhs < rhs, or not.
+    pub fn is_lt(&self, meta: &mut VirtualCells<F>, rotation: Option<Rotation>) -> Expression<F> {
+        meta.query_advice(self.lt, rotation.unwrap_or_else(Rotation::cur))
+    }
+}
+
+/// Chip that compares lhs < rhs.
 #[derive(Clone, Debug)]
-pub(crate) struct MonotoneConfig {
-    range_table: Column<Fixed>,
-    value: Column<Advice>,
+pub struct LtChip<F, const N_BYTES: usize> {
+    config: LtConfig<F, N_BYTES>,
 }
 
-/// MonotoneChip helps to check if an advice column is monotonically increasing
-/// within a range. With strict enabled, it disallows equality of two cell.
-pub(crate) struct MonotoneChip<F, const RANGE: usize, const INCR: bool, const STRICT: bool> {
-    config: MonotoneConfig,
-    _marker: PhantomData<F>,
-}
-
-#[allow(dead_code)]
-impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool>
-    MonotoneChip<F, RANGE, INCR, STRICT>
-{
-    /// configure which column should be check. q_enable here as a fn is
-    /// flexible for synthetic selector instead of a fixed one.
+impl<F: Field, const N_BYTES: usize> LtChip<F, N_BYTES> {
+    /// Configures the Lt chip.
     pub fn configure(
         meta: &mut ConstraintSystem<F>,
         q_enable: impl FnOnce(&mut VirtualCells<'_, F>) -> Expression<F>,
-        value: Column<Advice>,
-    ) -> MonotoneConfig {
-        let range_table = meta.fixed_column();
+        lhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
+        rhs: impl FnOnce(&mut VirtualCells<F>) -> Expression<F>,
+    ) -> LtConfig<F, N_BYTES> {
+        let lt = meta.advice_column();
+        let diff = [(); N_BYTES].map(|_| meta.advice_column());
+        let range = pow_of_two(N_BYTES * 8);
 
-        let config = MonotoneConfig { range_table, value };
-
-        meta.lookup_any("Range check", |meta| {
+        meta.create_gate("lt gate", |meta| {
             let q_enable = q_enable(meta);
-            let range_table = meta.query_fixed(config.range_table, Rotation::cur());
-            let value_diff = {
-                let value_cur = meta.query_advice(value, Rotation::cur());
-                let value_prev = meta.query_advice(value, Rotation::prev());
-                if INCR {
-                    value_cur - value_prev
-                } else {
-                    value_prev - value_cur
-                }
-            };
+            let lt = meta.query_advice(lt, Rotation::cur());
 
-            // If strict monotone, we subtract diff by one
-            // to make sure zero lookup fail
-            let min_diff = Expression::Constant(F::from(STRICT as u64));
+            let diff_bytes = diff
+                .iter()
+                .map(|c| meta.query_advice(*c, Rotation::cur()))
+                .collect::<Vec<Expression<F>>>();
 
-            vec![(q_enable * (value_diff - min_diff), range_table)]
+            let check_a =
+                lhs(meta) - rhs(meta) - expr_from_bytes(&diff_bytes) + (lt.clone() * range);
+
+            let check_b = bool_check(lt);
+
+            [check_a, check_b]
+                .into_iter()
+                .map(move |poly| q_enable.clone() * poly)
         });
 
-        config
+        LtConfig { lt, diff, range }
     }
 
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
-        layouter.assign_region(
-            || "range_table",
-            |mut meta| {
-                let max = RANGE - STRICT as usize;
-
-                for idx in 0..=max {
-                    meta.assign_fixed(
-                        || "range_table_value",
-                        self.config.range_table,
-                        idx,
-                        || Ok(F::from(idx as u64)),
-                    )?;
-                }
-
-                Ok(())
-            },
-        )
-    }
-
-    pub fn construct(config: MonotoneConfig) -> Self {
-        Self {
-            config,
-            _marker: PhantomData,
-        }
+    /// Constructs a Lt chip given a config.
+    pub fn construct(config: LtConfig<F, N_BYTES>) -> LtChip<F, N_BYTES> {
+        LtChip { config }
     }
 }
 
-impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Chip<F>
-    for MonotoneChip<F, RANGE, INCR, STRICT>
-{
-    type Config = MonotoneConfig;
+impl<F: Field, const N_BYTES: usize> LtInstruction<F> for LtChip<F, N_BYTES> {
+    fn assign(
+        &self,
+        region: &mut Region<'_, F>,
+        offset: usize,
+        lhs: F,
+        rhs: F,
+    ) -> Result<(), Error> {
+        let config = self.config();
+
+        let lt = lhs < rhs;
+        region.assign_advice(
+            || "lt chip: lt",
+            config.lt,
+            offset,
+            || Ok(F::from(lt as u64)),
+        )?;
+
+        let diff = (lhs - rhs) + (if lt { config.range } else { F::zero() });
+        let diff_bytes = diff.to_repr();
+        let diff_bytes = diff_bytes.as_ref();
+        for (idx, diff_column) in config.diff.iter().enumerate() {
+            region.assign_advice(
+                || format!("lt chip: diff byte {}", idx),
+                *diff_column,
+                offset,
+                || Ok(F::from(diff_bytes[idx] as u64)),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<F: Field, const N_BYTES: usize> Chip<F> for LtChip<F, N_BYTES> {
+    type Config = LtConfig<F, N_BYTES>;
     type Loaded = ();
 
     fn config(&self) -> &Self::Config {
@@ -108,23 +152,60 @@ impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Chip
         &()
     }
 }
+
+
+
+macro_rules! try_test_circuit {
+        ($values:expr, $checks:expr, $result:expr) => {{
+            // let k = usize::BITS - $values.len().leading_zeros();
+
+            // TODO: remove zk blinding factors in halo2 to restore the
+            // correct k (without the extra + 2).
+            let k = usize::BITS - $values.len().leading_zeros() + 2;
+            let circuit = TestCircuit::<Fr> {
+                values: Some($values),
+                checks: Some($checks),
+                _marker: PhantomData,
+            };
+            let prover = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();
+            assert_eq!(prover.verify(), $result);
+        }};
+    }
+
+macro_rules! try_test_circuit_error {
+        ($values:expr, $checks:expr) => {{
+            // let k = usize::BITS - $values.len().leading_zeros();
+
+            // TODO: remove zk blinding factors in halo2 to restore the
+            // correct k (without the extra + 2).
+            let k = usize::BITS - $values.len().leading_zeros() + 2;
+            let circuit = TestCircuit::<Fr> {
+                values: Some($values),
+                checks: Some($checks),
+                _marker: PhantomData,
+            };
+            let prover = MockProver::<Fr>::run(k, &circuit, vec![]).unwrap();
+            assert!(prover.verify().is_err());
+        }};
+    }
 #[derive(Clone, Debug)]
-struct TestCircuitConfig {
+struct TestCircuitConfig<F> {
     q_enable: Selector,
     value: Column<Advice>,
-    mono_incr: MonotoneConfig,
+    check: Column<Advice>,
+    lt: LtConfig<F, 8>,
 }
 
 #[derive(Default)]
-struct TestCircuit<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> {
+struct TestCircuit<F: FieldExt> {
     values: Option<Vec<u64>>,
+    // checks[i] = lt(values[i + 1], values[i])
+    checks: Option<Vec<bool>>,
     _marker: PhantomData<F>,
 }
 
-impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Circuit<F>
-    for TestCircuit<F, RANGE, INCR, STRICT>
-{
-    type Config = TestCircuitConfig;
+impl<F: Field> Circuit<F> for TestCircuit<F> {
+    type Config = TestCircuitConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
@@ -134,18 +215,32 @@ impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Circ
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
         let q_enable = meta.complex_selector();
         let value = meta.advice_column();
+        let check = meta.advice_column();
 
-        let mono_incr = MonotoneChip::<F, RANGE, INCR, STRICT>::configure(
+        let lt = LtChip::configure(
             meta,
             |meta| meta.query_selector(q_enable),
-            value,
+            |meta| meta.query_advice(value, Rotation::prev()),
+            |meta| meta.query_advice(value, Rotation::cur()),
         );
 
-        Self::Config {
+        let config = Self::Config {
             q_enable,
             value,
-            mono_incr,
-        }
+            check,
+            lt,
+        };
+
+        meta.create_gate("check is_lt between adjacent rows", |meta| {
+            let q_enable = meta.query_selector(q_enable);
+
+            // This verifies lt(value::cur, value::next) is calculated correctly
+            let check = meta.query_advice(config.check, Rotation::cur());
+
+            vec![q_enable * (config.lt.is_lt(meta, None) - check)]
+        });
+
+        config
     }
 
     fn synthesize(
@@ -153,25 +248,45 @@ impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Circ
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        let monotone_chip =
-            MonotoneChip::<F, RANGE, INCR, STRICT>::construct(config.mono_incr.clone());
-
-        monotone_chip.load(&mut layouter)?;
+        let chip = LtChip::construct(config.lt);
 
         let values: Vec<_> = self
             .values
             .as_ref()
             .map(|values| values.iter().map(|value| F::from(*value)).collect())
             .ok_or(Error::Synthesis)?;
+        let checks = self.checks.as_ref().ok_or(Error::Synthesis)?;
+        let (first_value, values) = values.split_at(1);
+        let first_value = first_value[0];
 
         layouter.assign_region(
             || "witness",
             |mut region| {
-                for (idx, value) in values.iter().enumerate() {
-                    region.assign_advice(|| "value", config.value, idx, || Ok(*value))?;
-                    if idx > 0 {
-                        config.q_enable.enable(&mut region, idx)?;
-                    }
+                region.assign_advice(
+                    || "first row value",
+                    config.value,
+                    0,
+                    || Ok(first_value),
+                )?;
+
+                let mut value_prev = first_value;
+                for (idx, (value, check)) in values.iter().zip(checks).enumerate() {
+                    config.q_enable.enable(&mut region, idx + 1)?;
+                    region.assign_advice(
+                        || "check",
+                        config.check,
+                        idx + 1,
+                        || Ok(F::from(*check as u64)),
+                    )?;
+                    region.assign_advice(
+                        || "value",
+                        config.value,
+                        idx + 1,
+                        || Ok(*value),
+                    )?;
+                    chip.assign(&mut region, idx + 1, value_prev, *value)?;
+
+                    value_prev = *value;
                 }
 
                 Ok(())
@@ -180,45 +295,13 @@ impl<F: FieldExt, const RANGE: usize, const INCR: bool, const STRICT: bool> Circ
     }
 }
 
-macro_rules! gen_try_test_circuit {
-    ($range:expr, $incr:expr, $strict:expr) => {
-        fn try_test_circuit(values: Vec<u64>, result: Result<(), Vec<VerifyFailure>>) {
-            let circuit = TestCircuit::<Fp, $range, $incr, $strict> {
-                values: Some(values),
-                _marker: PhantomData,
-            };
-            let prover = MockProver::<Fp>::run(
-                usize::BITS - ($range as usize).leading_zeros(),
-                &circuit,
-                vec![],
-            )
-            .unwrap();
-            assert_eq!(prover.verify(), result);
-        }
-    };
-}
-
 fn main() {
-    test3();
+    //row_diff_is_lt
+    try_test_circuit!(vec![1, 2, 3, 4, 5], vec![true, true, true, true], Ok(()));
+    try_test_circuit!(vec![1, 2, 1, 3, 2], vec![true, false, true, false], Ok(()));
+    // error
+    try_test_circuit_error!(vec![5, 4, 3, 2, 1], vec![true, true, true, true]);
+    try_test_circuit_error!(vec![1, 2, 1, 3, 2], vec![false, true, false, true]);
+
     println!("Done!");
-}
-
-// strict monotone in range (ok)
-fn test1() {
-    gen_try_test_circuit!(16, true, true);
-    // strict monotone in range (ok)
-    try_test_circuit(vec![1, 2, 3, 6, 20], Ok(()));
-}
-
-// non-strict monotone in range (ok)
-fn test2() {
-    gen_try_test_circuit!(16, true, false);
-    try_test_circuit(vec![1001, 1002, 1002, 1004, 1015], Ok(()));
-}
-
-// strict monotone (decrease) in range (ok)
-fn test3() {
-    gen_try_test_circuit!(16, false, true);
-    // strict monotone in range (ok)
-    try_test_circuit(vec![20, 17, 15, 13], Ok(()));
 }
